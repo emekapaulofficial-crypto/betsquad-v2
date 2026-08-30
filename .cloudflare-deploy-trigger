@@ -1,0 +1,1 @@
+Cloudflare Pages deployment trigger. Build with npm run build and publish dist.
