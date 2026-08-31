@@ -27,10 +27,9 @@ function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [joinCode, setJoinCode] = useState("");
-  const [adminOpen, setAdminOpen] = useState(false);
-  const [adminMode, setAdminMode] = useState(false);
   const [notice, setNotice] = useState("");
   const [requests, setRequests] = useState([]);
+  const [authBusy, setAuthBusy] = useState(false);
   const slots = mode === "1v1" ? 2 : 4;
   const roomCode = useMemo(() => Math.random().toString(36).slice(2, 8).toUpperCase(), [room]);
 
@@ -47,32 +46,57 @@ function App() {
       if (!mounted) return;
       setSignedIn(!!session);
       setEmail(session?.user?.email || "");
+      if (!session) setAuthMode(null);
     });
     return () => { mounted = false; subscription.unsubscribe(); };
   }, []);
 
   async function authenticate() {
-    if (!email.trim() || !password) return showNotice("Enter your email and password.");
-    if (password.length < 6) return showNotice("Password must be at least 6 characters.");
-    const result = authMode === "signup"
-      ? await supabase.auth.signUp({ email: email.trim(), password })
-      : await supabase.auth.signInWithPassword({ email: email.trim(), password });
-    if (result.error) return showNotice(result.error.message);
-    if (authMode === "signup" && !result.data.session) {
-      setAuthMode(null);
-      return showNotice("Account created. Check your email to confirm the account before signing in.");
+    if (authBusy) return;
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !password) return showNotice("Enter your email and password.");
+    if (authMode === "signup" && password.length < 6) return showNotice("Password must be at least 6 characters.");
+    if (!/^\S+@\S+\.\S+$/.test(cleanEmail)) return showNotice("Enter a valid email address.");
+    setAuthBusy(true);
+    try {
+      if (authMode === "signup") {
+        const { data, error } = await supabase.auth.signUp({ email: cleanEmail, password, options: { data: { player_name: playerName.trim() } } });
+        if (error) throw error;
+        setPassword("");
+        setAuthMode(null);
+        if (data.session) showNotice("Account created and signed in.");
+        else showNotice("Account created. Check your email to confirm it before signing in.");
+      } else {
+        // Never treat typed credentials as proof of authentication. Supabase must return a real session.
+        const { data, error } = await supabase.auth.signInWithPassword({ email: cleanEmail, password });
+        if (error || !data?.session || !data?.user) {
+          setSignedIn(false);
+          throw new Error("Incorrect email or password.");
+        }
+        setEmail(data.user.email || cleanEmail);
+        setPassword("");
+        setAuthMode(null);
+        setSignedIn(true);
+        showNotice("Sign in successful.");
+      }
+    } catch (error) {
+      setSignedIn(false);
+      const message = error?.message || "Unable to authenticate.";
+      showNotice(authMode === "signin" ? "Incorrect email or password." : message);
+    } finally {
+      setAuthBusy(false);
     }
-    setAuthMode(null);
-    setPassword("");
-    showNotice(authMode === "signup" ? "Account created and signed in." : "Sign in successful.");
   }
 
   async function signOut() {
-    const { error } = await supabase.auth.signOut();
+    const { error } = await supabase.auth.signOut({ scope: "local" });
     if (error) return showNotice(error.message);
     setSignedIn(false);
+    setEmail("");
+    setPassword("");
     setWallet(0);
     setRequests([]);
+    setRoom(null);
     showNotice("You have been signed out.");
   }
 
@@ -106,21 +130,6 @@ function App() {
     setRequestType(null); setAmount(""); setReference("");
   }
 
-  function approveRequest(id) {
-    const item = requests.find(r => r.id === id);
-    if (!item) return;
-    setRequests(prev => prev.map(r => r.id === id ? { ...r, status: "Approved" } : r));
-    if (item.type === "deposit") setWallet(prev => prev + item.amount);
-    showNotice(item.type === "deposit" ? `Deposit approved. ₦${item.amount.toLocaleString()} added to the wallet.` : "Withdrawal approved for manual payout.");
-  }
-
-  function rejectRequest(id) {
-    const item = requests.find(r => r.id === id);
-    setRequests(prev => prev.map(r => r.id === id ? { ...r, status: "Rejected" } : r));
-    if (item?.type === "withdraw") setWallet(prev => prev + item.amount);
-    showNotice("Request rejected. Any reserved withdrawal amount has been returned.");
-  }
-
   return (
     <div className="app">
       <header className="topbar">
@@ -130,9 +139,7 @@ function App() {
           <button onClick={() => window.open("https://chat.whatsapp.com/KiyjdPps1zz92KHiiZv0d0", "_blank")}>WhatsApp</button>
         </div>
       </header>
-
       {notice && <div className="notice">{notice}</div>}
-
       <main>
         <section className="hero"><p className="eyebrow">MULTIPLAYER GAME PLATFORM</p><h1>Play together.<br/><span>Win together.</span></h1><p>Join players from different locations. Your original game engines and rules remain unchanged.</p><div className="hero-actions"><button className="primary big" onClick={() => document.getElementById("games")?.scrollIntoView({behavior:"smooth"})}>Choose a Game</button><button className="ghost big" onClick={() => document.getElementById("wallet")?.scrollIntoView({behavior:"smooth"})}>Open Wallet</button></div></section>
         <section className="rules"><div><strong>Starting pool</strong><span>₦500</span></div><div><strong>1v1</strong><span>One winner</span></div><div><strong>4 Players</strong><span>Two winners</span></div><div><strong>Platform fee</strong><span>10% configured</span></div></section>
@@ -144,7 +151,7 @@ function App() {
         <section id="games" className="games"><div className="section-title"><span className="section-kicker">GAME LOBBY</span><h2>Choose your arena</h2></div>{games.map(game => <article className="card" key={game.slug}><div className="badge">● LIVE READY</div><h2>{game.name}</h2><p>Original rules preserved</p><div className="mode-row">{game.modes.map(m => <button className={selectedGame.slug === game.slug && mode === m ? "mode active" : "mode"} key={m} onClick={() => {setSelectedGame(game);setMode(m);}}>{m}</button>)}</div><button className="primary play" onClick={() => {setSelectedGame(game);setMode(game.modes[0]);document.getElementById("lobby")?.scrollIntoView({behavior:"smooth"});}}>Create Match</button></article>)}</section>
         <section id="lobby" className="lobby"><span className="section-kicker">READY ROOM</span><h2>{selectedGame.name} — {mode}</h2><p>{slots} player slots • Match pool starts at ₦{startingPool}</p><div className="lobby-create"><input value={playerName} onChange={e => setPlayerName(e.target.value)} placeholder="Your player name"/><button className="primary" onClick={createRoom}>Create Match Room</button></div>{room && <div className="room"><div><small>YOUR ROOM CODE</small><strong>{room.code}</strong></div><button className="secondary" onClick={() => navigator.clipboard?.writeText(room.code).then(() => showNotice("Room code copied."))}>Copy Code</button><span>{room.players.length}/{room.max} players connected</span><p>Send this code to your opponent. They enter it in the <b>Join your opponent</b> box above.</p></div>}</section>
       </main>
-      {authMode && <div className="modal-backdrop"><div className="modal"><button className="close" onClick={() => setAuthMode(null)}>×</button><div className="modal-logo">B</div><h2>{authMode === "signup" ? "Create your Betsquad account" : "Welcome back"}</h2><p>{authMode === "signup" ? "Create a real account. Incorrect passwords will be rejected." : "Sign in with the email and password used for your account."}</p><input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email address" autoComplete="email"/><input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password (6+ characters)" autoComplete={authMode === "signup" ? "new-password" : "current-password"}/>{authMode === "signup" && <input value={playerName} onChange={e => setPlayerName(e.target.value)} placeholder="Player name"/>}<button className="primary" onClick={authenticate}>{authMode === "signup" ? "Create Account" : "Sign In"}</button><small>Authentication is handled by Supabase Auth. Your password is never stored in this website's JavaScript.</small></div></div>}
+      {authMode && <div className="modal-backdrop"><div className="modal"><button className="close" onClick={() => !authBusy && setAuthMode(null)}>×</button><div className="modal-logo">B</div><h2>{authMode === "signup" ? "Create your Betsquad account" : "Welcome back"}</h2><p>{authMode === "signup" ? "Create a real account. Your password is checked by secure authentication." : "Your password is verified by Supabase. Incorrect credentials will not sign you in."}</p><input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email address" autoComplete="email"/><input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password (6+ characters)" autoComplete={authMode === "signup" ? "new-password" : "current-password"}/>{authMode === "signup" && <input value={playerName} onChange={e => setPlayerName(e.target.value)} placeholder="Player name" autoComplete="name"/>}<button className="primary" disabled={authBusy} onClick={authenticate}>{authBusy ? "Checking…" : authMode === "signup" ? "Create Account" : "Sign In"}</button><small>Authentication is handled by Supabase Auth. This website does not store your password.</small></div></div>}
       <footer>Betsquad • Multiplayer platform • Play responsibly</footer>
     </div>
   );
