@@ -24,6 +24,8 @@ function App() {
   const [accountNumber, setAccountNumber] = useState("");
   const [authMode, setAuthMode] = useState(null);
   const [signedIn, setSignedIn] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [joinCode, setJoinCode] = useState("");
@@ -33,23 +35,83 @@ function App() {
   const [roomChannel, setRoomChannel] = useState(null);
   const slots = mode === "1v1" ? 2 : 4;
 
-  function showNotice(message) { setNotice(message); setTimeout(() => setNotice(""), 3500); }
+  function showNotice(message) {
+    setNotice(message);
+    setTimeout(() => setNotice(""), 3500);
+  }
 
+  // Restore the Supabase session before the UI decides whether a player is signed in.
+  // This prevents the brief signed-out state that was causing protected actions to
+  // repeatedly open the sign-in dialog after navigation/back/reload.
   useEffect(() => {
     let mounted = true;
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    let subscription;
+
+    async function restoreSession() {
+      try {
+        const { data, error } = await supabase.auth.getSession();
+        if (!mounted) return;
+        if (error) throw error;
+        const session = data?.session;
+        const user = session?.user || null;
+        setCurrentUser(user);
+        setSignedIn(!!user);
+        setEmail(user?.email || "");
+        if (user?.user_metadata?.player_name && !playerName) {
+          setPlayerName(user.user_metadata.player_name);
+        }
+      } catch {
+        if (mounted) {
+          setCurrentUser(null);
+          setSignedIn(false);
+        }
+      } finally {
+        if (mounted) setAuthReady(true);
+      }
+    }
+
+    restoreSession();
+    const result = supabase.auth.onAuthStateChange((_event, session) => {
       if (!mounted) return;
-      setSignedIn(!!session);
-      setEmail(session?.user?.email || "");
+      const user = session?.user || null;
+      setCurrentUser(user);
+      setSignedIn(!!user);
+      setEmail(user?.email || "");
+      if (user?.user_metadata?.player_name && !playerName) {
+        setPlayerName(user.user_metadata.player_name);
+      }
+      if (!user && authReady) setAuthMode(null);
     });
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!mounted) return;
-      setSignedIn(!!session);
-      setEmail(session?.user?.email || "");
-      if (!session) setAuthMode(null);
-    });
-    return () => { mounted = false; subscription.unsubscribe(); };
+    subscription = result.data.subscription;
+
+    return () => {
+      mounted = false;
+      subscription?.unsubscribe();
+    };
+    // The auth listener should be installed once; playerName/authReady are intentionally
+    // not dependencies because changing them must not recreate the listener.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Always ask Supabase for the current authenticated user before protected actions.
+  // React state can briefly lag behind the persisted Supabase session after navigation.
+  async function requireAuth() {
+    const { data, error } = await supabase.auth.getUser();
+    const user = data?.user || null;
+    if (error || !user) {
+      setCurrentUser(null);
+      setSignedIn(false);
+      setAuthMode("signin");
+      return null;
+    }
+    setCurrentUser(user);
+    setSignedIn(true);
+    setEmail(user.email || "");
+    if (user.user_metadata?.player_name && !playerName) {
+      setPlayerName(user.user_metadata.player_name);
+    }
+    return user;
+  }
 
   async function authenticate() {
     if (authBusy) return;
@@ -60,18 +122,31 @@ function App() {
     setAuthBusy(true);
     try {
       if (authMode === "signup") {
-        const { data, error } = await supabase.auth.signUp({ email: cleanEmail, password, options: { data: { player_name: playerName.trim() } } });
+        const { data, error } = await supabase.auth.signUp({
+          email: cleanEmail,
+          password,
+          options: { data: { player_name: playerName.trim() } },
+        });
         if (error) throw error;
         setPassword("");
-        setAuthMode(null);
-        if (data.session) showNotice("Account created and signed in.");
-        else showNotice("Account created. Check your email to confirm it before signing in.");
+        if (data?.session?.user) {
+          setCurrentUser(data.session.user);
+          setSignedIn(true);
+          setEmail(data.session.user.email || cleanEmail);
+          setAuthMode(null);
+          showNotice("Account created and signed in.");
+        } else {
+          setAuthMode(null);
+          showNotice("Account created. Check your email to confirm it before signing in.");
+        }
       } else {
         const { data, error } = await supabase.auth.signInWithPassword({ email: cleanEmail, password });
         if (error || !data?.session || !data?.user) {
+          setCurrentUser(null);
           setSignedIn(false);
           throw new Error("Incorrect email or password.");
         }
+        setCurrentUser(data.user);
         setEmail(data.user.email || cleanEmail);
         setPassword("");
         setAuthMode(null);
@@ -80,15 +155,29 @@ function App() {
       }
     } catch (error) {
       setSignedIn(false);
+      setCurrentUser(null);
       showNotice(authMode === "signin" ? "Incorrect email or password." : (error?.message || "Unable to authenticate."));
-    } finally { setAuthBusy(false); }
+    } finally {
+      setAuthBusy(false);
+    }
   }
 
   async function signOut() {
-    if (roomChannel) { try { await roomChannel.untrack(); } catch {} await supabase.removeChannel(roomChannel); setRoomChannel(null); }
+    if (roomChannel) {
+      try { await roomChannel.untrack(); } catch {}
+      await supabase.removeChannel(roomChannel);
+      setRoomChannel(null);
+    }
     const { error } = await supabase.auth.signOut({ scope: "local" });
     if (error) return showNotice(error.message);
-    setSignedIn(false); setEmail(""); setPassword(""); setWallet(0); setRequests([]); setRoom(null);
+    setCurrentUser(null);
+    setSignedIn(false);
+    setEmail("");
+    setPassword("");
+    setWallet(0);
+    setRequests([]);
+    setRoom(null);
+    setAuthMode(null);
     showNotice("You have been signed out.");
   }
 
@@ -111,32 +200,36 @@ function App() {
   }
 
   async function createRoom() {
-    if (!signedIn) return setAuthMode("signin");
+    const user = await requireAuth();
+    if (!user) return;
     if (!playerName.trim()) return showNotice("Enter your player name first.");
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      const user = sessionData?.session?.user;
-      if (!user) return setAuthMode("signin");
       const { data, error } = await supabase.rpc("create_betsquad_room", {
-        p_game_type: selectedGame.slug, p_mode: mode === "1v1" ? "1v1" : "4-player", p_stake: Number(startingPool), p_display_name: playerName.trim(),
+        p_game_type: selectedGame.slug,
+        p_mode: mode === "1v1" ? "1v1" : "4-player",
+        p_stake: Number(startingPool),
+        p_display_name: playerName.trim(),
       });
       if (error) throw error;
       const created = data?.room || data;
       setRoom({ id: created.id, code: created.code, players: [{ id: user.id, name: playerName.trim() }], max: created.max_players || slots, game: selectedGame.name, mode });
       await openRoomChannel(created.id, user.id, playerName.trim());
       showNotice(`Room ${created.code} created. Share this code with your opponent.`);
-    } catch (error) { showNotice(error?.message || "Unable to create room. Please try again."); }
+    } catch (error) {
+      showNotice(error?.message || "Unable to create room. Please try again.");
+    }
   }
 
   async function joinRoom() {
-    if (!signedIn) return setAuthMode("signin");
-    const code = joinCode.trim().toUpperCase();
+    const user = await requireAuth();
+    if (!user) return;
+    const code = joinCode.trim().toUpperCase().replace(/[\s-]/g, "");
     if (code.length < 4) return showNotice("Enter the room code you received.");
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      const user = sessionData?.session?.user;
-      if (!user) return setAuthMode("signin");
-      const { data, error } = await supabase.rpc("join_betsquad_room", { p_room_code: code, p_display_name: playerName.trim() || "Player" });
+      const { data, error } = await supabase.rpc("join_betsquad_room", {
+        p_room_code: code,
+        p_display_name: playerName.trim() || "Player",
+      });
       if (error) throw error;
       const joined = data?.room || data;
       const members = data?.players || [];
@@ -145,12 +238,15 @@ function App() {
       await openRoomChannel(joined.id, user.id, playerName.trim() || "Player", playerList);
       showNotice(`Joined room ${joined.code}. You are now in the same live room.`);
       document.getElementById("lobby")?.scrollIntoView({ behavior: "smooth" });
-    } catch (error) { showNotice(error?.message || "Room not found or no seat is available."); }
+    } catch (error) {
+      showNotice(error?.message || "Room not found or no seat is available.");
+    }
   }
 
-  function submitRequest() {
+  async function submitRequest() {
+    const user = await requireAuth();
+    if (!user) return;
     const value = Number(amount);
-    if (!signedIn) return setAuthMode("signin");
     if (!value || value <= 0) return showNotice("Enter a valid amount.");
     if (requestType === "deposit" && !reference.trim()) return showNotice("Enter your OPay transaction reference.");
     if (requestType === "withdraw" && (!accountName.trim() || !bankName.trim() || !accountNumber.trim())) return showNotice("Enter the account details the admin should use for payment.");
@@ -159,17 +255,21 @@ function App() {
     setRequests(prev => [request, ...prev]);
     if (requestType === "withdraw") setWallet(prev => prev - value);
     showNotice(`${requestType === "deposit" ? "Deposit" : "Withdrawal"} request submitted. ${requestType === "withdraw" ? "The amount is reserved while pending." : "Admin review is required."}`);
-    setRequestType(null); setAmount(""); setReference("");
+    setRequestType(null);
+    setAmount("");
+    setReference("");
   }
+
+  const showSignedInUI = authReady && signedIn;
 
   return (
     <div className="app">
-      <header className="topbar"><div><div className="brand">BETSQUAD</div><div className="tag">Play. Compete. Win.</div></div><div className="top-actions">{signedIn ? <><span className="balance">Wallet: ₦{wallet.toLocaleString()}</span><button onClick={signOut}>Sign Out</button></> : <><button onClick={() => setAuthMode("signin")}>Sign In</button><button className="primary" onClick={() => setAuthMode("signup")}>Create Account</button></>}<button onClick={() => window.open("https://chat.whatsapp.com/KiyjdPps1zz92KHiiZv0d0", "_blank")}>WhatsApp</button></div></header>
+      <header className="topbar"><div><div className="brand">BETSQUAD</div><div className="tag">Play. Compete. Win.</div></div><div className="top-actions">{!authReady ? <span className="balance">Checking account…</span> : showSignedInUI ? <><span className="balance">Wallet: ₦{wallet.toLocaleString()}</span><button onClick={signOut}>Sign Out</button></> : <><button onClick={() => setAuthMode("signin")}>Sign In</button><button className="primary" onClick={() => setAuthMode("signup")}>Create Account</button></>}<button onClick={() => window.open("https://chat.whatsapp.com/KiyjdPps1zz92KHiiZv0d0", "_blank")}>WhatsApp</button></div></header>
       {notice && <div className="notice">{notice}</div>}
       <main>
         <section className="hero"><p className="eyebrow">MULTIPLAYER GAME PLATFORM</p><h1>Play together.<br/><span>Win together.</span></h1><p>Join players from different locations. Your original game engines and rules remain unchanged.</p><div className="hero-actions"><button className="primary big" onClick={() => document.getElementById("games")?.scrollIntoView({behavior:"smooth"})}>Choose a Game</button><button className="ghost big" onClick={() => document.getElementById("wallet")?.scrollIntoView({behavior:"smooth"})}>Open Wallet</button></div></section>
         <section className="rules"><div><strong>Starting pool</strong><span>₦500</span></div><div><strong>1v1</strong><span>One winner</span></div><div><strong>4 Players</strong><span>Two winners</span></div><div><strong>Platform fee</strong><span>10% configured</span></div></section>
-        <section className="account-panel"><div><span className="section-kicker">ACCOUNT</span><h2>{signedIn ? "Your Betsquad account" : "Create your player account"}</h2><p>{signedIn ? `Signed in as ${email}. Your game and wallet activity is linked to this account.` : "Sign up so your profile, matches and wallet requests can be linked to you."}</p></div>{!signedIn && <button className="primary" onClick={() => setAuthMode("signup")}>Create Account</button>}</section>
+        <section className="account-panel"><div><span className="section-kicker">ACCOUNT</span><h2>{showSignedInUI ? "Your Betsquad account" : "Create your player account"}</h2><p>{showSignedInUI ? `Signed in as ${email}. Your game and wallet activity is linked to this account.` : "Sign up so your profile, matches and wallet requests can be linked to you."}</p></div>{!showSignedInUI && authReady && <button className="primary" onClick={() => setAuthMode("signup")}>Create Account</button>}</section>
         <section id="wallet" className="wallet-panel"><div><span className="section-kicker">WALLET</span><h2>Money & requests</h2><p>Your balance changes only after an administrator approves a deposit. Withdrawals are reviewed before manual payout.</p></div><div className="wallet-balance"><small>Available balance</small><strong>₦{wallet.toLocaleString()}</strong></div><div className="wallet-actions"><button className="primary" onClick={() => setRequestType("deposit")}>＋ Deposit Request</button><button className="secondary" onClick={() => setRequestType("withdraw")}>− Withdraw Request</button></div></section>
         {requestType && <section className="request-panel"><div className="request-head"><div><span className="section-kicker">WALLET REQUEST</span><h3>{requestType === "deposit" ? "Request a deposit" : "Request a withdrawal"}</h3></div><button className="close-inline" onClick={() => setRequestType(null)}>×</button></div>{requestType === "deposit" ? <div className="payment-destination"><span>PAYMENT DESTINATION</span><strong>OPay</strong><b>Account: 9152926691</b><b>Name: Paul</b><small>Make the payment first. Then submit the amount and your OPay transaction reference. Your wallet is credited only after admin verification.</small></div> : <div className="payment-destination withdrawal"><span>MANUAL PAYOUT DETAILS</span><small>Enter the account where you want the admin to send your approved withdrawal.</small><input value={accountName} onChange={e => setAccountName(e.target.value)} placeholder="Account name"/><input value={bankName} onChange={e => setBankName(e.target.value)} placeholder="Bank name"/><input value={accountNumber} onChange={e => setAccountNumber(e.target.value)} placeholder="Account number"/></div>}<input value={amount} onChange={e => setAmount(e.target.value)} type="number" min="1" placeholder="Amount (₦)"/><input value={reference} onChange={e => setReference(e.target.value)} placeholder={requestType === "deposit" ? "OPay transaction reference" : "Withdrawal note (optional)"}/><div className="form-actions"><button className="primary" onClick={submitRequest}>Submit {requestType === "deposit" ? "Deposit" : "Withdrawal"} Request</button><button className="ghost" onClick={() => setRequestType(null)}>Cancel</button></div></section>}
         {requests.length > 0 && <section className="history"><span className="section-kicker">MY REQUESTS</span><h2>Wallet request history</h2>{requests.map(r => <div className="history-row" key={r.id}><div><strong>{r.type === "deposit" ? "Deposit" : "Withdrawal"}</strong><small>{new Date(r.id).toLocaleString()}</small></div><strong>₦{r.amount.toLocaleString()}</strong><span className={`status ${r.status.toLowerCase()}`}>{r.status}</span></div>)}</section>}
